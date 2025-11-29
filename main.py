@@ -9,10 +9,15 @@ from deep_translator import GoogleTranslator
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
+from PIL import Image
 
 if "translated_columns" not in st.session_state:
     st.session_state.translated_columns = None
 
+logo = Image.open("logo.png")
+
+st.sidebar.image(logo, use_container_width=True)
+st.image("logo.png", width=250)
 
 # =========================================
 # CONFIG GERAL
