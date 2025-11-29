@@ -3,10 +3,16 @@ import pandas as pd
 import numpy as np
 import io
 import plotly.express as px
+import re
 
+from deep_translator import GoogleTranslator
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
+
+if "translated_columns" not in st.session_state:
+    st.session_state.translated_columns = None
+
 
 # =========================================
 # CONFIG GERAL
@@ -178,7 +184,7 @@ uploaded_file = st.sidebar.file_uploader(
 if file_type == "CSV":
     st.sidebar.markdown('<div class="sidebar-title">⚙️ Parâmetros CSV</div>', unsafe_allow_html=True)
     sep = st.sidebar.text_input("Separador", value=",")
-    decimal = st.sidebar.text_input("Separador decimal", value=",")
+    decimal = st.sidebar.text_input("Separador decimal", value=".")
 else:
     sep = None
     decimal = None
@@ -187,7 +193,7 @@ st.sidebar.markdown('<div class="sidebar-title">🌐 Tradução de cabeçalho</d
 translate_headers_opt = st.sidebar.checkbox(
     "Traduzir cabeçalhos EN ➜ PT",
     value=False,
-    help="Converte nomes de colunas comuns para português; você pode ajustar o dicionário no código"
+    help="Traduz nomes de colunas via serviço automático; pode impactar performance em muitos campos."
 )
 
 st.sidebar.markdown('<div class="sidebar-title">ℹ️ Observação</div>', unsafe_allow_html=True)
@@ -199,44 +205,86 @@ st.sidebar.markdown(
 # =========================================
 # FUNÇÕES AUXILIARES
 # =========================================
-def load_data(file, file_type, sep, decimal) -> pd.DataFrame:
+
+# Tradutor global
+translator = GoogleTranslator(source="en", target="pt")
+
+
+def load_data(file, sep, decimal) -> pd.DataFrame:
+    """
+    Carrega CSV ou Excel, priorizando o sufixo do arquivo.
+    Para CSV, usa separador/decimal informados ou defaults razoáveis.
+    """
     name = file.name.lower()
-    if file_type == "CSV" or name.endswith(".csv"):
-        return pd.read_csv(file, sep=sep or ";", decimal=decimal or ",")
+    if name.endswith(".csv"):
+        sep = sep if sep not in [None, ""] else ","
+        decimal = decimal if decimal not in [None, ""] else "."
+        return pd.read_csv(file, sep=sep, decimal=decimal)
     else:
         return pd.read_excel(file, engine="openpyxl")
 
-# dicionário simples de tradução de cabeçalho (pode ser ajustado conforme o dataset)
-HEADER_MAP = {
-    "age": "Idade",
-    "gender": "Genero",
-    "score": "Nota",
-    "previous_scores": "Notas_Anteriores",
-    "school_type": "Tipo_Escola",
-    "study_time": "Tempo_Estudo",
-    "family_income": "Renda_Familiar",
-}
+
+def _normalize_header(text: str) -> str:
+    """
+    Normaliza o texto traduzido para nome de coluna:
+      - remove espaços extras
+      - troca espaços por "_"
+      - remove caracteres problemáticos
+    """
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\sáéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ]", "", text)
+    text = text.replace(" ", "_")
+    return text
+
+
+def _prepare_source_header(col: str) -> str:
+    """
+    Prepara o cabeçalho original para mandar ao tradutor:
+      - converte "_" e "-" em espaço
+      - quebra CamelCase: HoursStudied -> Hours Studied
+    """
+    s = re.sub(r"[_\-]+", " ", col)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    return s.strip()
+
 
 def translate_headers(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
+    """
+    Traduz automaticamente cabeçalhos (majoritariamente em inglês)
+    para português usando o GoogleTranslator (deep-translator).
+
+    Se a tradução falhar em alguma coluna, mantém o nome original.
+    """
     if not enabled:
         return df
 
     new_cols = {}
     for col in df.columns:
-        key = col.lower()
-        if key in HEADER_MAP:
-            new_cols[col] = HEADER_MAP[key]
-        else:
-            # fallback simples: substitui "_" por espaço e deixa Title Case
-            base = col.replace("_", " ")
-            new_cols[col] = base.title().replace(" ", "_")
+        try:
+            src = _prepare_source_header(col)
+            if not src:
+                new_cols[col] = col
+                continue
+
+            translated = translator.translate(src)
+            if not translated or translated.strip().lower() == src.strip().lower():
+                new_cols[col] = col
+            else:
+                new_cols[col] = _normalize_header(translated)
+        except Exception:
+            new_cols[col] = col
+
     return df.rename(columns=new_cols)
+
 
 def numeric_columns(df: pd.DataFrame):
     return df.select_dtypes(include=[np.number]).columns.tolist()
 
+
 def categorical_columns(df: pd.DataFrame):
     return df.select_dtypes(exclude=[np.number]).columns.tolist()
+
 
 def generate_pdf_report(df, num_cols, cat_cols, target_col, feature_cols) -> bytes:
     buffer = io.BytesIO()
@@ -324,8 +372,28 @@ if uploaded_file is None:
 
 # Carrega dados
 try:
-    df = load_data(uploaded_file, file_type=file_type, sep=sep, decimal=decimal)
-    df = translate_headers(df, translate_headers_opt)
+    df = load_data(uploaded_file, sep=sep, decimal=decimal)
+
+    # Traduz apenas na primeira vez que o arquivo é carregado
+    if translate_headers_opt:
+        if st.session_state.translated_columns is None or \
+        st.session_state.translated_columns["source_name"] != uploaded_file.name:
+            
+            translated_df = translate_headers(df.copy(), True)
+            st.session_state.translated_columns = {
+                "source_name": uploaded_file.name,
+                "columns": translated_df.columns.tolist()
+            }
+            df.columns = translated_df.columns
+
+        else:
+            # Reaplica nomes já traduzidos sem chamar API novamente
+            df.columns = st.session_state.translated_columns["columns"]
+
+    else:
+        # Se a tradução estiver desativada pelo usuário
+        st.session_state.translated_columns = None
+
 except Exception as e:
     st.error(f"Erro ao carregar o arquivo: {e}")
     st.stop()
